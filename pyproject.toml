@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lit-fetcher"
+version = "1.0.0"
+description = "全自动文献抓取工具：搜索 → 导入 Zotero → 下载 PDF → 自动分类"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.28",
+    "pyautogui>=0.9",
+    "pyzotero>=1.6",
+    "click>=8.0",
+]
+
+[project.scripts]
+lit-fetcher = "lit_fetcher.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
