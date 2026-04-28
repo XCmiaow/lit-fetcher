@@ -11,6 +11,7 @@ lit-fetcher — 全自动文献抓取 CLI
 import click
 from .commands.search import search_papers
 from .commands.zotero_ops import import_to_zotero, trigger_find_fulltext, classify_library, show_status
+from .commands.translate import translate_pdf, translate_all
 
 
 @click.group()
@@ -67,6 +68,22 @@ def classify():
     """自动分类 Zotero 文献 + 去重"""
     click.echo("Classifying Zotero library...")
     classify_library()
+
+
+@main.command()
+@click.argument("key", required=False)
+@click.option("--all-papers", "-a", is_flag=True, help="翻译所有已下载 PDF 的文献")
+def translate(key, all_papers):
+    """PDF 对照翻译：提取段落 → 翻译中文 → 贴回原位置
+
+    用法: lit-fetcher translate WP8A39R3          # 翻译指定文献
+          lit-fetcher translate --all-papers        # 翻译全部文献"""
+    if all_papers:
+        translate_all()
+    elif key:
+        translate_pdf(key)
+    else:
+        click.echo("请指定 Zotero item key 或使用 --all-papers", err=True)
 
 
 @main.command()
