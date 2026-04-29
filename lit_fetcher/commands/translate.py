@@ -78,45 +78,91 @@ def _run_pdf2zh(pdf_path: Path, output_dir: Path) -> Path:
 
 
 def _attach_to_zotero(item_key: str, pdf_path: Path, parent_title: str = ""):
-    """Register translated PDF as an attachment to the Zotero item"""
-    api = "http://127.0.0.1:23119/api/users/0"
-    items = requests.get(f"{api}/items?limit=200", timeout=10).json()
+    """Register translated PDF as attachment to Zotero item.
 
-    # Check if already attached
+    Strategy: try Zotero Web API first (needs API key), else save file locally
+    and instruct user. The dual PDF is already in the Zotero storage directory.
+    """
+    local_api = "http://127.0.0.1:23119/api/users/0"
+    try:
+        items = requests.get(f"{local_api}/items?limit=200", timeout=10).json()
+    except requests.RequestException:
+        print(f"  Zotero not reachable. File saved at: {pdf_path}")
+        return
+
+    # Check if already attached (look for dual-pdf child attachment)
     for item in items:
         data = item.get("data", {})
         if data.get("itemType") == "attachment":
             if data.get("parentItem") == item_key and "dual" in (data.get("title") or "").lower():
-                return  # Already attached
+                print(f"  Already attached: [{item_key}]")
+                return
 
-    # Create attachment via Zotero Connector
+    api_key = os.environ.get("ZOTERO_API_KEY", "")
+    library_id = _detect_library_id(items)
+
+    if api_key and library_id:
+        _attach_via_web_api(item_key, pdf_path, parent_title, api_key, library_id)
+    else:
+        # Fallback: file already in storage dir, user can add manually
+        print(f"  Translated PDF ready: {pdf_path.name}")
+        print(f"  To attach in Zotero: right-click [{item_key}] → Add Attachment →")
+        print(f"  Attach Stored Copy of File → select '{pdf_path.name}'")
+        print(f"  (Set ZOTERO_API_KEY env var for automatic attachment)")
+
+
+def _detect_library_id(items: list) -> str:
+    """Extract library user ID from Zotero API response"""
+    for item in items:
+        lib = item.get("library", {})
+        uid = lib.get("id")
+        if uid:
+            return str(uid)
+    return ""
+
+
+def _attach_via_web_api(
+    item_key: str, pdf_path: Path, parent_title: str,
+    api_key: str, library_id: str,
+):
+    """Create attachment via Zotero Web API (api.zotero.org)"""
+    import base64
+
+    # 1. Upload file to Zotero
     filename = pdf_path.name
     content = pdf_path.read_bytes()
     md5 = hashlib.md5(content).hexdigest()
     mtime = int(pdf_path.stat().st_mtime * 1000)
+    content_b64 = base64.b64encode(content).decode()
 
+    upload_url = (
+        f"https://api.zotero.org/users/{library_id}/items/{item_key}/children"
+    )
+    headers = {
+        "Zotero-API-Key": api_key,
+        "Content-Type": "application/json",
+    }
     payload = [{
         "itemType": "attachment",
         "parentItem": item_key,
-        "title": f"CN Translation (zh-CN)",
-        "filename": filename,
+        "title": "CN Translation (zh-CN)",
         "contentType": "application/pdf",
+        "filename": filename,
         "md5": md5,
         "mtime": mtime,
-        "note": f"Bilingual translation via pdf2zh. Original: {parent_title}",
+        "note": f"Bilingual Chinese translation via pdf2zh",
         "tags": [{"tag": "translated"}, {"tag": "zh-CN"}],
+        "linkMode": "imported_file",
     }]
 
-    r = requests.post(
-        f"{api}/items",
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=30,
-    )
-    if r.status_code not in (200, 201):
-        print(f"  Warning: Zotero attachment failed ({r.status_code}): {r.text[:200]}")
-    else:
-        print(f"  Attached to Zotero item [{item_key}]")
+    try:
+        r = requests.post(upload_url, json=payload, headers=headers, timeout=30)
+        if r.status_code in (200, 201):
+            print(f"  Attached to Zotero [{item_key}]")
+        else:
+            print(f"  Web API error ({r.status_code}): {r.text[:150]}")
+    except requests.RequestException as e:
+        print(f"  Web API unreachable: {e}")
 
 
 def translate_pdf(item_key: str) -> Path:
