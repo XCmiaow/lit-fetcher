@@ -20,18 +20,50 @@ def _find_zotero_storage() -> Path:
     if env:
         return Path(env)
 
+    # Try Zotero local API first (most reliable)
+    try:
+        r = requests.get("http://127.0.0.1:23119/api/users/0/items?limit=1", timeout=3)
+        if r.ok:
+            items = r.json()
+            if items:
+                # Walk up from library ID to find storage path
+                lib_id = str(items[0].get("library", {}).get("id", ""))
+                # Check custom data directory via prefs
+                try:
+                    import sqlite3
+                    prefs = Path(os.path.expandvars(
+                        r"%APPDATA%\Zotero\Zotero\Profiles"
+                    ))
+                    for profile in prefs.glob("*.default*"):
+                        prefs_db = profile / "prefs.js"
+                        if prefs_db.exists():
+                            content = prefs_db.read_text(errors="ignore")
+                            import re
+                            m = re.search(
+                                r'user_pref\("extensions\.zotero\.dataDir",\s*"([^"]+)"\)',
+                                content
+                            )
+                            if m:
+                                custom = Path(m.group(1)) / "storage"
+                                if custom.exists():
+                                    return custom
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # Fall back to default profile path
     profiles = Path(os.path.expandvars(r"%APPDATA%\Zotero\Zotero\Profiles"))
-    if not profiles.exists():
-        raise FileNotFoundError(f"Zotero profiles not found: {profiles}")
+    if profiles.exists():
+        defaults = sorted(profiles.glob("*.default*"))
+        if defaults:
+            storage = defaults[0] / "storage"
+            if storage.exists():
+                return storage
 
-    defaults = sorted(profiles.glob("*.default*"))
-    if not defaults:
-        raise FileNotFoundError(f"No default profile in: {profiles}")
-
-    storage = defaults[0] / "storage"
-    if not storage.exists():
-        raise FileNotFoundError(f"No storage in profile: {defaults[0]}")
-    return storage
+    raise FileNotFoundError(
+        "Cannot find Zotero storage. Set ZOTERO_STORAGE env var or ensure Zotero is running."
+    )
 
 
 ZOTERO_STORAGE = _find_zotero_storage()
