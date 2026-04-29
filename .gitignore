@@ -3,3 +3,5 @@ __pycache__/
 dist/
 .pytest_cache/
 lit_fetcher.egg-info/
+.memory/
+CLAUDE.md
