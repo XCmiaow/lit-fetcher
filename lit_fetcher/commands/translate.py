@@ -81,12 +81,17 @@ def find_pdf_for_item(item_key: str) -> Path:
     raise FileNotFoundError(f"No untranslated PDF in: {item_dir}")
 
 
-def _run_pdf2zh(pdf_path: Path, output_dir: Path) -> Path:
-    """Run pdf2zh to produce a bilingual PDF. Returns path to *-dual.pdf."""
+def _run_pdf2zh(pdf_path: Path, output_dir: Path, bilingual: bool = False) -> Path:
+    """Run pdf2zh to produce a Chinese PDF. Uses DEEPSEEK_API_KEY if set, else Google.
+
+    Returns path to *-zh.pdf (monolingual) or *-dual.pdf (bilingual).
+    """
+    service, env = _resolve_translator()
+
     cmd = [
         "pdf2zh", str(pdf_path),
         "-lo", "zh-CN",
-        "-s", "google",
+        "-s", service,
     ]
     result = subprocess.run(
         cmd,
@@ -94,19 +99,44 @@ def _run_pdf2zh(pdf_path: Path, output_dir: Path) -> Path:
         capture_output=True,
         text=True,
         timeout=600,
+        env={**os.environ, **env},
     )
     if result.returncode != 0:
         raise RuntimeError(f"pdf2zh failed:\n{result.stderr}")
 
     stem = pdf_path.stem
-    dual = output_dir / f"{stem}-dual.pdf"
-    if dual.exists():
-        return dual
-    # fallback: pdf2zh might produce a different naming pattern
-    candidates = sorted(output_dir.glob(f"{stem}*-dual*.pdf"))
+    target_suffix = "dual" if bilingual else "zh"
+    target = output_dir / f"{stem}-{target_suffix}.pdf"
+    if target.exists():
+        return target
+    candidates = sorted(output_dir.glob(f"{stem}*-{target_suffix}*.pdf"))
     if candidates:
         return candidates[0]
     raise FileNotFoundError(f"pdf2zh output not found for: {stem}")
+
+
+def _resolve_translator() -> tuple[str, dict]:
+    """Determine translation service from environment variables.
+
+    Supports: DeepSeek (DEEPSEEK_API_KEY), OpenAI (OPENAI_API_KEY), Google (default)
+    Returns (service_arg, extra_env_vars)
+    """
+    deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    openai_key = os.environ.get("OPENAI_API_KEY", "")
+
+    if deepseek_key:
+        return (
+            "openai:deepseek-chat",
+            {
+                "OPENAI_API_KEY": deepseek_key,
+                "OPENAI_BASE_URL": "https://api.deepseek.com",
+            },
+        )
+    if openai_key:
+        model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        return ("openai:" + model, {})
+
+    return ("google", {})
 
 
 def _attach_to_zotero(item_key: str, pdf_path: Path, parent_title: str = ""):
@@ -197,50 +227,56 @@ def _attach_via_web_api(
         print(f"  Web API unreachable: {e}")
 
 
-def translate_pdf(item_key: str) -> Path:
-    """Translate a Zotero PDF via pdf2zh and attach bilingual version"""
+def translate_pdf(item_key: str, bilingual: bool = False) -> Path:
+    """Translate a Zotero PDF via pdf2zh and attach to item.
+
+    Args:
+        item_key: Zotero item key
+        bilingual: If True, produce bilingual dual PDF; else Chinese-only
+    """
     pdf_path = find_pdf_for_item(item_key)
 
-    # Check cache
+    mode = "dual" if bilingual else "zh"
     cache_key = hashlib.md5(pdf_path.read_bytes()).hexdigest()[:12]
-    dual_path = ZOTERO_STORAGE / item_key / f"translated_{cache_key}-dual.pdf"
-    if dual_path.exists():
-        print(f"  Already translated: {dual_path.name}")
-        _attach_to_zotero(item_key, dual_path, pdf_path.stem)
-        return dual_path
+    output_path = ZOTERO_STORAGE / item_key / f"translated_{cache_key}-{mode}.pdf"
+    if output_path.exists():
+        print(f"  Already translated: {output_path.name}")
+        _attach_to_zotero(item_key, output_path, pdf_path.stem)
+        return output_path
 
     print(f"  Source: {pdf_path.name}")
-    print(f"  Translating with pdf2zh (this may take several minutes)...")
+    service_name = _resolve_translator()[0]
+    print(f"  Engine: {service_name}")
+    print(f"  Translating with pdf2zh...")
     t0 = time.time()
 
-    # Run pdf2zh in the item's storage directory
-    item_dir = ZOTERO_STORAGE / item_key
-    result = _run_pdf2zh(pdf_path, item_dir)
-
+    result = _run_pdf2zh(pdf_path, ZOTERO_STORAGE / item_key, bilingual=bilingual)
     elapsed = time.time() - t0
     print(f"  Done in {elapsed:.0f}s")
 
     # Rename to cache-friendly name
-    final = item_dir / f"translated_{cache_key}-dual.pdf"
+    final = output_path
     if result != final:
         result.rename(final)
 
-    # Clean up the zh-only version if present
-    zh_only = item_dir / f"{pdf_path.stem}-zh.pdf"
-    if zh_only.exists():
-        zh_only.unlink()
+    # Clean up the other output variant
+    other_suffix = "zh" if bilingual else "dual"
+    other = (ZOTERO_STORAGE / item_key / f"{pdf_path.stem}-{other_suffix}.pdf")
+    if other.exists() and other != final:
+        other.unlink()
 
-    # Remove original pdf2zh output files (*-dual.pdf) if not renamed
-    orig_dual = item_dir / f"{pdf_path.stem}-dual.pdf"
-    if orig_dual.exists() and orig_dual != final:
-        orig_dual.unlink()
+    # Clean up original pdf2zh output files
+    for extra_suffix in ["-dual.pdf", "-zh.pdf"]:
+        extra = ZOTERO_STORAGE / item_key / f"{pdf_path.stem}{extra_suffix}"
+        if extra.exists() and extra != final:
+            extra.unlink()
 
     print(f"  Saved: {final.name}")
     _attach_to_zotero(item_key, final, pdf_path.stem)
     return final
 
 
-def translate_all():
+def translate_all(bilingual: bool = False):
     """Translate all PDFs in Zotero that haven't been translated yet"""
     api = "http://127.0.0.1:23119/api/users/0"
     try:
@@ -278,7 +314,7 @@ def translate_all():
     for i, (key, title) in enumerate(papers, 1):
         print(f"[{i}/{len(papers)}] {title[:70]}")
         try:
-            translate_pdf(key)
+            translate_pdf(key, bilingual=bilingual)
         except Exception as e:
             print(f"  Error: {e}")
         print()

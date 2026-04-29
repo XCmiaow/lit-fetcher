@@ -73,15 +73,19 @@ def classify():
 @main.command()
 @click.argument("key", required=False)
 @click.option("--all-papers", "-a", is_flag=True, help="翻译所有已下载 PDF 的文献")
-def translate(key, all_papers):
-    """PDF 对照翻译：提取段落 → 翻译中文 → 贴回原位置
+@click.option("--bilingual/--chinese-only", default=False, help="双语对照 / 纯中文（默认）")
+def translate(key, all_papers, bilingual):
+    """PDF 翻译：纯中文版（默认）或双语对照版
 
-    用法: lit-fetcher translate WP8A39R3          # 翻译指定文献
-          lit-fetcher translate --all-papers        # 翻译全部文献"""
+    DeepSeek 优先（DEEPSEEK_API_KEY），其次 OpenAI（OPENAI_API_KEY），兜底 Google。
+
+    用法: lit-fetcher translate WP8A39R3          # 纯中文
+          lit-fetcher translate WP8A39R3 --bilingual  # 双语对照
+          lit-fetcher translate --all-papers        # 翻译全部"""
     if all_papers:
-        translate_all()
+        translate_all(bilingual=bilingual)
     elif key:
-        translate_pdf(key)
+        translate_pdf(key, bilingual=bilingual)
     else:
         click.echo("请指定 Zotero item key 或使用 --all-papers", err=True)
 
