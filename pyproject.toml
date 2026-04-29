@@ -15,7 +15,7 @@ dependencies = [
     "pyzotero>=1.6",
     "click>=8.0",
     "pymupdf>=1.23",
-    "deep-translator>=1.11",
+    "pdf2zh>=1.7",
 ]
 
 [project.scripts]

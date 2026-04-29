@@ -1,17 +1,40 @@
-"""PDF 对照翻译：提取段落 → 翻译 → 以注释形式贴回原位置
+"""PDF 对照翻译 — 调用 pdf2zh 生成双语 PDF，挂载到 Zotero
 
 用法: lit-fetcher translate [ZOTERO_ITEM_KEY]"""
-import hashlib, json, os, re, sys, time
+
+import hashlib
+import os
+import re
+import subprocess
+import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import Optional
 
-import fitz  # pymupdf
-from deep_translator import GoogleTranslator
+import requests
+
+# ── Zotero profile auto-detection ──
+
+def _find_zotero_storage() -> Path:
+    """Auto-detect Zotero storage directory, or from env override"""
+    env = os.environ.get("ZOTERO_STORAGE")
+    if env:
+        return Path(env)
+
+    profiles = Path(os.path.expandvars(r"%APPDATA%\Zotero\Zotero\Profiles"))
+    if not profiles.exists():
+        raise FileNotFoundError(f"Zotero profiles not found: {profiles}")
+
+    defaults = sorted(profiles.glob("*.default*"))
+    if not defaults:
+        raise FileNotFoundError(f"No default profile in: {profiles}")
+
+    storage = defaults[0] / "storage"
+    if not storage.exists():
+        raise FileNotFoundError(f"No storage in profile: {defaults[0]}")
+    return storage
 
 
-ZOTERO_STORAGE = Path(os.path.expandvars(
-    r"%APPDATA%\Zotero\Zotero\Profiles\53xuvw1i.default\storage"
-))
+ZOTERO_STORAGE = _find_zotero_storage()
 
 
 def find_pdf_for_item(item_key: str) -> Path:
@@ -20,162 +43,160 @@ def find_pdf_for_item(item_key: str) -> Path:
     if not item_dir.exists():
         raise FileNotFoundError(f"Zotero item dir not found: {item_dir}")
     for f in item_dir.glob("*.pdf"):
-        return f
-    raise FileNotFoundError(f"No PDF in: {item_dir}")
+        # Skip already-translated files
+        if "translated" not in f.name and "-dual" not in f.name and "-zh" not in f.name:
+            return f
+    raise FileNotFoundError(f"No untranslated PDF in: {item_dir}")
 
 
-def extract_text_blocks(pdf_path: Path) -> List[dict]:
-    """Extract text blocks with positions from PDF"""
-    doc = fitz.open(pdf_path)
-    blocks = []
-    for page_num in range(len(doc)):
-        page = doc[page_num]
-        for block in page.get_text("blocks"):
-            text = block[4].strip()
-            if len(text) > 30:  # Skip short lines (headers, page numbers)
-                blocks.append({
-                    "page": page_num,
-                    "x0": block[0], "y0": block[1],
-                    "x1": block[2], "y1": block[3],
-                    "text": text,
-                })
-    doc.close()
-    return blocks
-
-
-def translate_blocks(blocks: List[dict], progress_cb=None) -> List[dict]:
-    """Translate each text block to Chinese"""
-    translator = GoogleTranslator(source="auto", target="zh-CN")
-    translated = []
-    for i, block in enumerate(blocks):
-        try:
-            # Split long text into chunks for more reliable translation
-            text = block["text"]
-            if len(text) > 4500:
-                # Split by sentences
-                sentences = re.split(r"(?<=[.!?])\s+", text)
-                chunks = []
-                chunk = ""
-                for s in sentences:
-                    if len(chunk) + len(s) < 4500:
-                        chunk += s + " "
-                    else:
-                        if chunk:
-                            chunks.append(chunk.strip())
-                        chunk = s + " "
-                if chunk:
-                    chunks.append(chunk.strip())
-                translations = []
-                for c in chunks:
-                    try:
-                        translations.append(translator.translate(c))
-                    except:
-                        translations.append("[翻译失败]")
-                zh_text = " ".join(translations)
-            else:
-                zh_text = translator.translate(text)
-
-            translated.append({**block, "zh": zh_text})
-            if progress_cb:
-                progress_cb(i + 1, len(blocks))
-            time.sleep(0.3)  # Rate limit
-        except Exception as e:
-            translated.append({**block, "zh": f"[翻译失败: {e}]"})
-    return translated
-
-
-def inject_annotations(pdf_path: Path, blocks: List[dict], output_path: Path) -> Path:
-    """Inject translations as PDF annotations at the same positions"""
-    doc = fitz.open(pdf_path)
-
-    for block in blocks:
-        page = doc[block["page"]]
-        zh_text = block.get("zh", "")
-        if not zh_text or zh_text.startswith("[翻译失败"):
-            continue
-
-        # Add a translucent yellow highlight + popup note with Chinese
-        rect = fitz.Rect(block["x0"], block["y0"], block["x1"], block["y1"])
-        annot = page.add_highlight_annot(rect)
-        annot.set_info(
-            title="中文翻译",
-            content=zh_text[:500],
-        )
-        annot.update()
-
-    doc.save(output_path, incremental=False, encryption=fitz.PDF_ENCRYPT_KEEP)
-    doc.close()
-    return output_path
-
-
-def translate_pdf(item_key: str) -> Path:
-    """Main: translate a Zotero PDF and save annotated version, then attach to Zotero"""
-    pdf_path = find_pdf_for_item(item_key)
-
-    # Check cache — don't re-translate
-    cache_key = hashlib.md5(pdf_path.read_bytes()).hexdigest()[:12]
-    translated_path = ZOTERO_STORAGE / item_key / f"translated_{cache_key}.pdf"
-    if translated_path.exists():
-        print(f"  Already translated: {translated_path}")
-        _attach_to_zotero(item_key, translated_path)
-        return translated_path
-
-    print(f"  Source: {pdf_path}")
-    print(f"  Extracting text blocks...")
-    blocks = extract_text_blocks(pdf_path)
-    print(f"  Found {len(blocks)} text blocks")
-
-    print(f"  Translating to Chinese...")
-    translated = translate_blocks(
-        blocks,
-        progress_cb=lambda i, n: print(f"\r    {i}/{n} blocks", end="", flush=True),
+def _run_pdf2zh(pdf_path: Path, output_dir: Path) -> Path:
+    """Run pdf2zh to produce a bilingual PDF. Returns path to *-dual.pdf."""
+    cmd = [
+        "pdf2zh", str(pdf_path),
+        "-lo", "zh-CN",
+        "-s", "google",
+    ]
+    result = subprocess.run(
+        cmd,
+        cwd=str(output_dir),
+        capture_output=True,
+        text=True,
+        timeout=600,
     )
-    print()
+    if result.returncode != 0:
+        raise RuntimeError(f"pdf2zh failed:\n{result.stderr}")
 
-    print(f"  Injecting annotations...")
-    result = inject_annotations(pdf_path, translated, translated_path)
-    print(f"  Saved: {result}")
+    stem = pdf_path.stem
+    dual = output_dir / f"{stem}-dual.pdf"
+    if dual.exists():
+        return dual
+    # fallback: pdf2zh might produce a different naming pattern
+    candidates = sorted(output_dir.glob(f"{stem}*-dual*.pdf"))
+    if candidates:
+        return candidates[0]
+    raise FileNotFoundError(f"pdf2zh output not found for: {stem}")
 
-    # Attach to Zotero
-    _attach_to_zotero(item_key, result)
-    return result
 
-
-def _attach_to_zotero(item_key: str, pdf_path: Path):
-    """Ensure the translated PDF is linked to the Zotero item"""
-    import requests
-    api = f"http://127.0.0.1:23119/api/users/0/items"
-    items = requests.get(f"{api}?limit=200").json()
+def _attach_to_zotero(item_key: str, pdf_path: Path, parent_title: str = ""):
+    """Register translated PDF as an attachment to the Zotero item"""
+    api = "http://127.0.0.1:23119/api/users/0"
+    items = requests.get(f"{api}/items?limit=200", timeout=10).json()
 
     # Check if already attached
     for item in items:
-        if item["data"].get("itemType") == "attachment":
-            parent = item["data"].get("parentItem")
-            title = item["data"].get("title", "")
-            if parent == item_key and "translated" in title.lower():
+        data = item.get("data", {})
+        if data.get("itemType") == "attachment":
+            if data.get("parentItem") == item_key and "dual" in (data.get("title") or "").lower():
                 return  # Already attached
 
-    # Attach by copying to storage and noting it
-    print(f"  Attached to Zotero item [{item_key}]")
+    # Create attachment via Zotero Connector
+    filename = pdf_path.name
+    content = pdf_path.read_bytes()
+    md5 = hashlib.md5(content).hexdigest()
+    mtime = int(pdf_path.stat().st_mtime * 1000)
+
+    payload = [{
+        "itemType": "attachment",
+        "parentItem": item_key,
+        "title": f"CN Translation (zh-CN)",
+        "filename": filename,
+        "contentType": "application/pdf",
+        "md5": md5,
+        "mtime": mtime,
+        "note": f"Bilingual translation via pdf2zh. Original: {parent_title}",
+        "tags": [{"tag": "translated"}, {"tag": "zh-CN"}],
+    }]
+
+    r = requests.post(
+        f"{api}/items",
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        timeout=30,
+    )
+    if r.status_code not in (200, 201):
+        print(f"  Warning: Zotero attachment failed ({r.status_code}): {r.text[:200]}")
+    else:
+        print(f"  Attached to Zotero item [{item_key}]")
+
+
+def translate_pdf(item_key: str) -> Path:
+    """Translate a Zotero PDF via pdf2zh and attach bilingual version"""
+    pdf_path = find_pdf_for_item(item_key)
+
+    # Check cache
+    cache_key = hashlib.md5(pdf_path.read_bytes()).hexdigest()[:12]
+    dual_path = ZOTERO_STORAGE / item_key / f"translated_{cache_key}-dual.pdf"
+    if dual_path.exists():
+        print(f"  Already translated: {dual_path.name}")
+        _attach_to_zotero(item_key, dual_path, pdf_path.stem)
+        return dual_path
+
+    print(f"  Source: {pdf_path.name}")
+    print(f"  Translating with pdf2zh (this may take several minutes)...")
+    t0 = time.time()
+
+    # Run pdf2zh in the item's storage directory
+    item_dir = ZOTERO_STORAGE / item_key
+    result = _run_pdf2zh(pdf_path, item_dir)
+
+    elapsed = time.time() - t0
+    print(f"  Done in {elapsed:.0f}s")
+
+    # Rename to cache-friendly name
+    final = item_dir / f"translated_{cache_key}-dual.pdf"
+    if result != final:
+        result.rename(final)
+
+    # Clean up the zh-only version if present
+    zh_only = item_dir / f"{pdf_path.stem}-zh.pdf"
+    if zh_only.exists():
+        zh_only.unlink()
+
+    # Remove original pdf2zh output files (*-dual.pdf) if not renamed
+    orig_dual = item_dir / f"{pdf_path.stem}-dual.pdf"
+    if orig_dual.exists() and orig_dual != final:
+        orig_dual.unlink()
+
+    print(f"  Saved: {final.name}")
+    _attach_to_zotero(item_key, final, pdf_path.stem)
+    return final
 
 
 def translate_all():
-    """Find and translate all PDFs in Zotero that haven't been translated yet"""
-    import requests
+    """Translate all PDFs in Zotero that haven't been translated yet"""
     api = "http://127.0.0.1:23119/api/users/0"
-    items = requests.get(f"{api}/items?limit=200").json()
+    try:
+        items = requests.get(f"{api}/items?limit=500", timeout=10).json()
+    except requests.RequestException:
+        print("Zotero is not running or Connector API not available.")
+        return
 
-    papers = [
-        (i["key"], i["data"].get("title", "?"))
-        for i in items
-        if i["data"].get("itemType") not in ("attachment", "note")
-        and any(
-            a["data"].get("itemType") == "attachment" and a["data"].get("parentItem") == i["key"]
+    # Find papers with PDFs but without translated attachments
+    papers = []
+    for i in items:
+        data = i.get("data", {})
+        if data.get("itemType") in ("attachment", "note"):
+            continue
+        key = i["key"]
+        has_translated = any(
+            a.get("data", {}).get("itemType") == "attachment"
+            and a["data"].get("parentItem") == key
+            and "dual" in (a["data"].get("title") or "").lower()
             for a in items
         )
-    ]
+        has_pdf = any(
+            a.get("data", {}).get("itemType") == "attachment"
+            and a["data"].get("parentItem") == key
+            for a in items
+        )
+        if has_pdf and not has_translated:
+            papers.append((key, data.get("title", "?")))
 
-    print(f"Papers with PDF: {len(papers)}\n")
+    if not papers:
+        print("All papers with PDFs already translated.")
+        return
+
+    print(f"Papers to translate: {len(papers)}\n")
     for i, (key, title) in enumerate(papers, 1):
         print(f"[{i}/{len(papers)}] {title[:70]}")
         try:
@@ -187,9 +208,9 @@ def translate_all():
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="PDF 对照翻译：调用 pdf2zh 生成双语 PDF")
     parser.add_argument("key", nargs="?", help="Zotero item key")
-    parser.add_argument("--all", action="store_true", help="Translate all PDFs")
+    parser.add_argument("--all", action="store_true", help="Translate all PDFs in library")
     args = parser.parse_args()
 
     if args.all:

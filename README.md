@@ -54,6 +54,19 @@ lit-fetcher classify
 
 按主题自动打标签、检测重复条目。
 
+### PDF 翻译
+
+```bash
+# 翻译指定文献
+lit-fetcher translate WP8A39R3
+
+# 批量翻译所有已下载 PDF 的文献
+lit-fetcher translate --all-papers
+```
+
+利用 pdf2zh 生成中英双语对照 PDF，自动挂载到 Zotero 条目下。
+翻译引擎：Google Translate，首次运行需下载布局模型（~500MB，仅一次）。
+
 ### 状态
 
 ```bash
@@ -69,7 +82,7 @@ lit-fetcher all "Aspen Plus distillation column optimization" --max 20
 等价于：
 
 ```bash
-lit-fetcher search "..."  →  lit-fetcher import --dois "..."  →  lit-fetcher pdf  →  lit-fetcher classify
+lit-fetcher search "..."  →  lit-fetcher import --dois "..."  →  lit-fetcher pdf  →  lit-fetcher classify  →  lit-fetcher translate --all-papers
 ```
 
 ## 工作流
@@ -88,6 +101,9 @@ Zotero 查找全文 (Sci-Hub + Unpaywall + 机构订阅)
   │  lit-fetcher classify
   ▼
 18 篇可阅读 PDF + 主题分类 + 去重
+  │  lit-fetcher translate --all-papers
+  ▼
+中英双语 PDF + Zotero 条目自动挂载
 ```
 
 ## 配置
